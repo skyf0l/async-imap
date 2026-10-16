@@ -564,6 +564,32 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    async fn parse_fetches_preview() {
+        let (send, recv) = bounded(10);
+        let responses = input_stream(&[
+            "* 1 FETCH (UID 4 PREVIEW \"She said \\\"hi\\\" from C:\\\\temp\")\r\n",
+            "* 2 FETCH (UID 9 PREVIEW {14}\r\nCafé C:\\\\temp)\r\n",
+            "* 3 FETCH (UID 11 PREVIEW NIL)\r\n",
+            "* 4 FETCH (UID 12)\r\n",
+        ]);
+        let mut stream = async_std::stream::from_iter(responses);
+        let id = RequestId("a".into());
+
+        let fetches = parse_fetches(&mut stream, send, id)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(recv.is_empty());
+
+        assert_eq!(fetches.len(), 4);
+        assert_eq!(fetches[0].preview(), Some("She said \"hi\" from C:\\temp"));
+        assert_eq!(fetches[1].preview(), Some("Café C:\\\\temp"));
+        assert_eq!(fetches[2].preview(), None);
+        assert_eq!(fetches[3].preview(), None);
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
     async fn parse_fetches_w_unilateral() {
         // https://github.com/mattnenterprise/rust-imap/issues/81
         let (send, recv) = bounded(10);
