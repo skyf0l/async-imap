@@ -1024,6 +1024,38 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
         Ok(names)
     }
 
+    /// The [`LIST` command with the `STATUS` return option](https://tools.ietf.org/html/rfc5819)
+    /// lists the names matching any of `mailbox_patterns` together with the status of each, in
+    /// one round trip instead of one [`Session::status`] per name. The server must advertise
+    /// the `LIST-STATUS` capability; a server without it refuses the command, which is
+    /// returned as an error.
+    ///
+    /// The patterns are sent as given, like the pattern of [`Session::list`], so the caller
+    /// quotes them as needed. `data_items` are the status items, as for [`Session::status`],
+    /// e.g. `"(MESSAGES UNSEEN)"`. A name the server sends no status for, such as one that
+    /// cannot be selected, comes with `None`.
+    pub async fn list_status(
+        &mut self,
+        reference_name: Option<&str>,
+        mailbox_patterns: &[&str],
+        data_items: &str,
+    ) -> Result<Vec<(Name, Option<Mailbox>)>> {
+        let id = self
+            .run_command(&format!(
+                "LIST {} ({}) RETURN (STATUS {})",
+                validate_str(reference_name.unwrap_or(""))?,
+                mailbox_patterns.join(" "),
+                data_items
+            ))
+            .await?;
+        parse_names_with_status(
+            &mut self.conn.stream,
+            self.unsolicited_responses_tx.clone(),
+            id,
+        )
+        .await
+    }
+
     /// The [`LSUB` command](https://tools.ietf.org/html/rfc3501#section-6.3.9) returns a subset of
     /// names from the set of names that the user has declared as being "active" or "subscribed".
     /// The arguments to this method the same as for [`Session::list`].

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use async_channel as channel;
 use futures_util::stream::Stream;
@@ -128,21 +128,7 @@ pub(crate) async fn parse_status<T: Stream<Item = io::Result<ResponseData>> + Un
             Response::MailboxData(MailboxDatum::Status { mailbox, status })
                 if mailbox == expected_mailbox =>
             {
-                for attribute in status {
-                    match attribute {
-                        StatusAttribute::HighestModSeq(highest_modseq) => {
-                            mbox.highest_modseq = Some(*highest_modseq)
-                        }
-                        StatusAttribute::Messages(exists) => mbox.exists = *exists,
-                        StatusAttribute::Recent(recent) => mbox.recent = *recent,
-                        StatusAttribute::UidNext(uid_next) => mbox.uid_next = Some(*uid_next),
-                        StatusAttribute::UidValidity(uid_validity) => {
-                            mbox.uid_validity = Some(*uid_validity)
-                        }
-                        StatusAttribute::Unseen(unseen) => mbox.unseen = Some(*unseen),
-                        _ => {}
-                    }
-                }
+                apply_status_attributes(&mut mbox, status);
             }
             _ => {
                 handle_unilateral(resp, unsolicited.clone());
@@ -151,6 +137,86 @@ pub(crate) async fn parse_status<T: Stream<Item = io::Result<ResponseData>> + Un
     }
 
     Ok(mbox)
+}
+
+fn apply_status_attributes(mbox: &mut Mailbox, status: &[StatusAttribute]) {
+    for attribute in status {
+        match attribute {
+            StatusAttribute::HighestModSeq(highest_modseq) => {
+                mbox.highest_modseq = Some(*highest_modseq)
+            }
+            StatusAttribute::Messages(exists) => mbox.exists = *exists,
+            StatusAttribute::Recent(recent) => mbox.recent = *recent,
+            StatusAttribute::UidNext(uid_next) => mbox.uid_next = Some(*uid_next),
+            StatusAttribute::UidValidity(uid_validity) => mbox.uid_validity = Some(*uid_validity),
+            StatusAttribute::Unseen(unseen) => mbox.unseen = Some(*unseen),
+            _ => {}
+        }
+    }
+}
+
+/// Parses the reply to a `LIST ... RETURN (STATUS ...)` command
+/// ([RFC 5819](https://tools.ietf.org/html/rfc5819)): every listed name, paired with the
+/// status the server sent for it, or `None` when it sent none (a name that cannot be
+/// selected). Unlike [`parse_names`], a refused command is an error, so a caller can tell
+/// a server without the extension from one with no matching names.
+pub(crate) async fn parse_names_with_status<
+    T: Stream<Item = io::Result<ResponseData>> + Unpin + Send,
+>(
+    stream: &mut T,
+    unsolicited: channel::Sender<UnsolicitedResponse>,
+    command_tag: RequestId,
+) -> Result<Vec<(Name, Option<Mailbox>)>> {
+    let mut names = Vec::new();
+    let mut statuses = HashMap::new();
+
+    while let Some(resp) = stream.try_next().await? {
+        match resp.parsed() {
+            Response::Done {
+                tag,
+                status,
+                outcome,
+                ..
+            } if tag == &command_tag => {
+                use imap_proto::Status;
+                match status {
+                    Status::Ok => {
+                        break;
+                    }
+                    Status::Bad => {
+                        return Err(Error::Bad(format!("outcome: {outcome:?}")));
+                    }
+                    Status::No => {
+                        return Err(Error::No(format!("outcome: {outcome:?}")));
+                    }
+                    _ => {
+                        return Err(Error::Io(io::Error::other(format!(
+                            "status: {status:?}, outcome: {outcome:?}"
+                        ))));
+                    }
+                }
+            }
+            Response::MailboxData(MailboxDatum::List { .. }) => {
+                names.push(Name::from_mailbox_data(resp));
+            }
+            Response::MailboxData(MailboxDatum::Status { mailbox, status }) => {
+                let mut mbox = Mailbox::default();
+                apply_status_attributes(&mut mbox, status);
+                statuses.insert(mailbox.to_string(), mbox);
+            }
+            _ => {
+                handle_unilateral(resp, unsolicited.clone());
+            }
+        }
+    }
+
+    Ok(names
+        .into_iter()
+        .map(|name| {
+            let status = statuses.remove(name.name());
+            (name, status)
+        })
+        .collect())
 }
 
 pub(crate) fn parse_expunge<T: Stream<Item = io::Result<ResponseData>> + Unpin + Send>(
@@ -514,6 +580,44 @@ mod tests {
         );
         assert_eq!(names[0].delimiter(), Some("."));
         assert_eq!(names[0].name(), "INBOX");
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    async fn parse_names_with_status_test() {
+        let (send, recv) = bounded(10);
+        let responses = input_stream(&[
+            "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n",
+            "* STATUS \"INBOX\" (MESSAGES 12 UNSEEN 3)\r\n",
+            "* 4 EXISTS\r\n",
+            "* LIST (\\Noselect) \"/\" \"Archive\"\r\n",
+            "A0001 OK List completed\r\n",
+        ]);
+        let mut stream = async_std::stream::from_iter(responses);
+        let id = RequestId("A0001".into());
+
+        let names = parse_names_with_status(&mut stream, send, id)
+            .await
+            .unwrap();
+        assert_eq!(recv.recv().await.unwrap(), UnsolicitedResponse::Exists(4));
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[0].0.name(), "INBOX");
+        let inbox = names[0].1.as_ref().unwrap();
+        assert_eq!((inbox.exists, inbox.unseen), (12, Some(3)));
+        assert_eq!(names[1].0.name(), "Archive");
+        assert!(names[1].1.is_none());
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    async fn parse_names_with_status_refused() {
+        let (send, _recv) = bounded(10);
+        let responses = input_stream(&["A0001 BAD Unknown LIST option\r\n"]);
+        let mut stream = async_std::stream::from_iter(responses);
+        let id = RequestId("A0001".into());
+
+        let refused = parse_names_with_status(&mut stream, send, id).await;
+        assert!(matches!(refused, Err(Error::Bad(_))));
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
